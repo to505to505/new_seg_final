@@ -1,0 +1,6 @@
+train: /home/dsa/stenosis/data/stenosis_arcade/train/images
+val: /home/dsa/stenosis/data/stenosis_arcade/val/images
+test: /home/dsa/stenosis/data/stenosis_arcade/test/images
+
+nc: 2
+names: ['stenosis_0', 'stenosis_1']

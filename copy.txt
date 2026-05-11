@@ -1,0 +1,1 @@
+conda activate stenosis && cd /home/dsa/new_seg_final/ODySSeI && streamlit run odyssei/app.py --server.port 8501

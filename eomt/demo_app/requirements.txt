@@ -1,0 +1,13 @@
+streamlit
+pydicom
+opencv-python-headless
+numpy
+Pillow
+matplotlib
+scipy
+shapely
+torch
+torchvision
+timm
+pyyaml
+lightning

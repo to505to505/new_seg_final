@@ -1,0 +1,7 @@
+path: /home/dsa/new_seg_final/patch_dataset
+train: train/images
+val: val/images
+test: test/images
+
+names:
+  0: vessel

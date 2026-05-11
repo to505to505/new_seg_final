@@ -1,0 +1,4 @@
+names:
+  0: vessel
+path: /home/dsa/new_seg_final/single_dataset/train
+train: images

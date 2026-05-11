@@ -1,0 +1,12 @@
+names:
+  0: lad
+  1: lm
+  2: lcx
+  3: lad_b
+  4: lcx_b
+  5: inter
+  6: rca
+  7: pda
+  8: pborca
+path: /home/dsa/segmentation/segmentation_modules/MaskDino/data/single_dataset/train
+train: images

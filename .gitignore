@@ -1,0 +1,78 @@
+# ── Model weights & checkpoints ──────────────────────────────────────────────
+weights/
+*.pth
+*.pt
+*.ckpt
+
+# ── Training runs & logs ──────────────────────────────────────────────────────
+eomt/runs/
+eomt/logs/
+eomt/wandb/
+old_runs_eomt/
+
+# ── Datasets (images) ─────────────────────────────────────────────────────────
+cadica_base/images/
+single_dataset/train/images/
+single_dataset/val/images/
+single_dataset/test/images/
+patch_dataset/train/images/
+patch_dataset/val/images/
+patch_dataset/test/images/
+stenosis_arcade/train/images/
+stenosis_arcade/val/images/
+stenosis_arcade/test/images/
+stenosis_arcade/valid/
+ODySSeI/data/
+
+# ── Common image/video/archive formats ───────────────────────────────────────
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.tif
+*.mp4
+*.avi
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.gz
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+.Python
+
+# ── Jupyter checkpoints ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ── Build / packaging ─────────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ── Test / coverage ───────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

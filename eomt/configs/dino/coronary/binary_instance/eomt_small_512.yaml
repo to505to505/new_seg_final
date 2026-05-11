@@ -1,0 +1,30 @@
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 1
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: runs
+      name: coronary_binary_instance_eomt_small_512_dinov1
+model:
+  class_path: training.mask_classification_instance.MaskClassificationInstance
+  init_args:
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [2960, 7400, 11840]
+    attn_mask_annealing_end_steps: [7400, 11840, 14800]
+    warmup_steps: [296, 592]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 100
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: facebook/dino-vits8
+            patch_size: 8
+data:
+  class_path: datasets.coronary_instance.CoronaryInstance
+  init_args:
+    num_classes: 1
+    label_subdir: labels_binary
