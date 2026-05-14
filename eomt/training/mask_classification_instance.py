@@ -48,6 +48,8 @@ class MaskClassificationInstance(LightningModule):
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
         load_ckpt_class_head: bool = True,
+        test_results_filename: str = "test_results.txt",
+        solo_only: bool = False,
     ):
         super().__init__(
             network=network,
@@ -75,6 +77,8 @@ class MaskClassificationInstance(LightningModule):
         self.stuff_classes: List[int] = []
         self.eval_top_k_instances = eval_top_k_instances
         self.lcr_weight = lcr_weight
+        self.test_results_filename = test_results_filename
+        self.solo_only = solo_only
 
         self.criterion = MaskClassificationLoss(
             num_points=num_points,
@@ -150,11 +154,23 @@ class MaskClassificationInstance(LightningModule):
                     )
                 )
 
-            self.update_metrics_instance(preds, targets, i)
-            self.update_lcr_instance(preds, i)
+            if not self.solo_only:
+                self.update_metrics_instance(preds, targets, i)
+                self.update_lcr_instance(preds, i)
+            self.update_solo_instance(preds, targets, i)
 
     def on_validation_epoch_end(self):
         self._on_eval_epoch_end_instance("val")
 
     def on_validation_end(self):
         self._on_eval_end_instance("val")
+
+    def test_step(self, batch, batch_idx=0):
+        return self.eval_step(batch, batch_idx, "test")
+
+    def on_test_epoch_end(self):
+        self._on_eval_epoch_end_instance("test")
+
+    def on_test_end(self):
+        self._on_eval_end_instance("test")
+        self._write_test_results_txt(self.test_results_filename)

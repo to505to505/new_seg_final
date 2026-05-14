@@ -1,0 +1,303 @@
+How Video-EoMT Works
+====================
+
+Overview
+--------
+Video-EoMT is a minimal video extension of the 2D EoMT instance-segmentation
+model. The 2D model takes a single frame (B, 3, H, W), runs it through a ViT
+encoder, injects object queries in the last few ViT blocks, and predicts
+mask_logits + class_logits.
+
+Video-EoMT takes a clip (B, T, 3, H, W), reuses the exact same 2D EoMT weights
+per frame, and inserts one new module - ETF (Early Temporal Fusion) - between
+the early ViT stage and the query/decoder stage. ETF mixes features at the
+same patch position across time so the model can use neighbouring frames,
+while at iteration 0 it behaves identically to the 2D model.
+
+Main goal: start video training from an already-trained 2D checkpoint, do not
+break its behaviour on the first step, and give the model a lightweight
+temporal information-exchange mechanism.
+
+Key files:
+  models/video_eomt.py                          - VideoEoMT model
+  models/etf.py                                 - EarlyTemporalFusion module
+  datasets/video_coronary_instance.py           - video dataset / datamodule
+  training/video_mask_classification_instance.py- video training module
+  training/num_consistency_loss.py              - L_num temporal loss
+  configs/dinov2/coronary/video_instance/       - video configs
+
+
+1. The base 2D EoMT
+-------------------
+models/eomt.py forward:
+  1. Input image x: (B, 3, H, W).
+  2. Normalise with encoder.pixel_mean / pixel_std.
+  3. ViT patch embedding -> (B, prefix + N, D), where N = patch tokens,
+     prefix = CLS/register tokens, D = embed_dim.
+  4. Run all ViT blocks.
+  5. At the start of the last num_blocks blocks, prepend object queries:
+       x = concat(queries, prefix_tokens, patch_tokens)
+     Coronary configs use num_q=100, num_blocks=3. For ViT-Small (12 blocks):
+       L1 = first 9 blocks (no queries)
+       L2 = last 3 blocks (queries + masked attention)
+  6. In L2 blocks the model predicts, per layer:
+       mask_logits_per_layer:  (B, K, H/4, W/4)
+       class_logits_per_layer: (B, K, C+1)
+     K = number of queries, C = real classes, +1 = no-object class.
+  7. Mask logits also drive masked-attention annealing.
+
+The mask head, class head, query embedding, upscale block, masked attention
+and loss are all unchanged in Video-EoMT. Only the temporal module is new.
+
+
+2. ETF - Early Temporal Fusion (models/etf.py)
+----------------------------------------------
+After the L1 blocks we have per-frame patch features. With T frames they sit
+as patch_tokens: (B*T, N, D).
+
+ETF reshapes them into temporal sequences per spatial patch position:
+  (B*T, N, D) -> (B, T, N, D) -> (B, N, T, D) -> (B*N, T, D)
+
+A MultiheadAttention then runs along the T axis. It does NOT mix all patches
+with all patches - it only mixes the same patch position across frames:
+  before2 <-> before1 <-> central <-> after1 <-> after2
+
+Then it reshapes back: (B*N, T, D) -> (B*T, N, D).
+
+ETF consists of:
+  LayerNorm(D)
+  MultiheadAttention(D, etf_heads, batch_first=True)
+  residual connection
+
+Critical detail: the attention out_proj weight and bias are zero-initialised:
+  nn.init.zeros_(self.attn.out_proj.weight)
+  nn.init.zeros_(self.attn.out_proj.bias)
+
+So at iteration 0 ETF is an identity mapping (x_out = x + 0). This makes
+loading a 2D checkpoint safe: the model initially behaves exactly like 2D
+EoMT per frame, and the temporal module only starts to learn during video
+fine-tuning. (Identity was verified: max difference vs per-frame EoMT = 0.0.)
+
+
+3. VideoEoMT (models/video_eomt.py)
+-----------------------------------
+VideoEoMT(EoMT) inherits everything from EoMT and overrides only forward.
+Inherited unchanged: query embedding, class_head, mask_head, upscale,
+_predict, _attn, _attn_mask, masked-attention logic. The constructor only
+adds ETF params: etf_heads (8), etf_dropout (0.0).
+
+Forward data path:
+  1. Input x: (B, T, 3, H, W).
+  2. Flatten time into batch: x -> (B*T, 3, H, W). This lets the unchanged
+     2D ViT backbone and weights be used as-is.
+  3. Normalise, patch_embed, positional embedding -> (B*T, prefix + N, D).
+  4. Compute L1/L2 split: total_blocks = len(blocks), l1 = total_blocks -
+     num_blocks. For ViT-Small with num_blocks=3: total_blocks=12, l1=9.
+  5. First L1 blocks run per-frame, exactly like 2D EoMT.
+  6. Just before the first L2 block, apply ETF to patch tokens only:
+       prefix_tokens = x[:, :prefix, :]
+       patch_tokens  = x[:, prefix:, :]
+       patch_tokens  = self.etf(patch_tokens, B, T)
+       x = concat(prefix_tokens, patch_tokens)
+     Prefix tokens are NOT mixed in time, to keep CLS/register semantics.
+  7. At the same point, prepend object queries (same as EoMT):
+       x = concat(queries, prefix_tokens, patch_tokens)
+  8. Last num_blocks blocks run with the standard EoMT logic: masked
+     attention, per-layer predictions, final prediction.
+  9. Output is EoMT-compatible but with time flattened into batch:
+       mask_logits_per_layer:  list of (B*T, K, H/4, W/4)
+       class_logits_per_layer: list of (B*T, K, C+1)
+     The training module reshapes (B*T, ...) back to (B, T, ...) when it
+     needs the central frame or the temporal loss.
+
+If a plain 2D tensor (B, 3, H, W) is passed, T is set to 1 and the model
+runs as a passthrough (ETF effectively does nothing at T=1).
+
+
+4. Loading a 2D checkpoint
+--------------------------
+Almost all parameter names match EoMT (network.encoder.*, network.q.*,
+network.class_head.*, network.mask_head.*, network.upscale.*), so a 2D
+checkpoint can initialise the video model. The only new params are
+network.etf.*, which are absent from the 2D checkpoint - and that is fine.
+
+VideoMaskClassificationInstance._raise_on_incompatible handles this:
+  - ignores missing keys starting with "network.etf." (new identity module)
+  - ignores unexpected keys starting with "criterion." (the criterion is
+    built later in MaskClassificationInstance.__init__, after the parent's
+    _load_ckpt call, so those keys can transiently look unexpected)
+
+Config init looks like:
+  ckpt_path: .../runs/<2d_run>/checkpoints/best.ckpt
+  delta_weights: false
+  load_ckpt_class_head: true   (class count unchanged, so keep trained head)
+
+
+5. Video dataset (datasets/video_coronary_instance.py)
+------------------------------------------------------
+DataModule: VideoCoronaryInstance.  Dataset: VideoCoronaryDataset.
+
+Expected directory layout (sequence_dataset):
+  train/images/<clip_id>/<clip_id>_before2.png
+  train/images/<clip_id>/<clip_id>_before1.png
+  train/images/<clip_id>/<clip_id>_central.png
+  train/images/<clip_id>/<clip_id>_after1.png
+  train/images/<clip_id>/<clip_id>_after2.png
+  train/labels/<clip_id>.txt
+(same for val and test)
+
+Frame order is fixed: FRAME_ORDER = [before2, before1, central, after1,
+after2], so T=5.
+
+Important: labels exist for the CENTRAL frame only. Neighbouring frames are
+temporal context; the supervised instance-segmentation loss is computed on
+the central frame.
+
+YOLO polygon labels are read from .txt and turned into instance masks:
+target["masks"], target["labels"], target["is_crowd"].
+
+Geometric augmentations (hflip, scale jitter, pad, random/centre crop) are
+sampled once per clip and applied identically to all T frames, and to the
+central-frame masks - so masks stay aligned with the central image.
+
+If skelrecall is enabled, the dataset also computes target["skeletons"]
+(skeleton_enabled, skeleton_num_dilations).
+
+Collate:
+  train -> imgs (B, T, 3, H, W), targets list[dict] length B
+  val/test -> tuple of clips (different original sizes), targets tuple
+
+There is also FlatToVideoCoronaryDataset / FlatToVideoCoronaryInstance: a
+wrapper that reads a plain single-image dataset and repeats each frame T
+times to form a pseudo-clip, useful for evaluating VideoEoMT on non-video
+data.
+
+
+6. Video training module
+------------------------
+training/video_mask_classification_instance.py:
+VideoMaskClassificationInstance(MaskClassificationInstance).
+
+Inherited unchanged: optimizer/scheduler, Hungarian matching +
+MaskClassificationLoss, mask/dice/class losses, skeleton loss, connectivity
+loss, metrics (mAP, LCR, Combined), test_results txt writer.
+
+Only training_step and eval_step change.
+
+6.1 Training step
+  Input: imgs (B, T, 3, H, W); targets (central-frame labels only).
+  Model returns mask/class logits per block as (B*T, K, ...).
+  Each output is reshaped (B*T, ...) -> (B, T, ...) and the central frame
+  is selected (central_idx = T // 2, i.e. index 2 for T=5 -> "central").
+  On the central frame all standard EoMT losses are computed: mask, dice,
+  class, plus skeleton loss (if skeleton_coefficient > 0) and connectivity
+  loss (if connectivity_coefficient > 0). This part is identical to 2D
+  training.
+
+6.2 L_num - temporal count-consistency loss
+  training/num_consistency_loss.py: num_consistency_loss, applied to the
+  final block's class logits over all T frames: (B, T, Q, C+1).
+  Algorithm:
+    1. Drop the no-object channel: logits = pred_logits[..., :-1]
+    2. Per-query foreground confidence: p = softmax(logits).amax(-1) -> (B,T,Q)
+    3. Soft "is an object" indicator:
+         soft_indicator = sigmoid((p - threshold) / soft_temp)
+    4. Soft object count per frame: n_t = soft_indicator.sum(-1) -> (B, T)
+    5. Reference count = median over time, detached: n_r = detach(median_T(n_t))
+    6. Loss: L_num = mean(|n_t - n_r|)
+  Added to the total: total = standard_eomt_loss + consistency_weight * L_num
+  Current video configs: consistency_weight=0.5, consistency_threshold=0.3,
+  consistency_soft_temp=0.05.
+  Meaning: across neighbouring frames of the same angiographic sequence, the
+  number of confident predicted instances should not jump around. This
+  regularises temporal stability without needing labels on every frame.
+
+6.3 Evaluation (central-frame only)
+  Validation/test run the whole clip but only score the central frame.
+  Pipeline:
+    1. Each clip is resize/pad'd like 2D instance eval, per-clip.
+    2. VideoEoMT predicts logits for all B*T frames.
+    3. Logits reshaped to (B, T, ...).
+    4. Central-frame logits selected.
+    5. Mask logits interpolated and reverted to the original size.
+    6. mAP, LCR, solo metrics and Combined computed.
+  Combined = (1 - lcr_weight) * mAP + lcr_weight * LCR  (usually lcr_weight=0.2)
+
+
+7. Configs
+----------
+Located in configs/dinov2/coronary/video_instance/. Main train configs:
+  1. video_eomt_small_512_dinov2.yaml
+       base: runs/coronary_instance_eomt_small_512_dinov2/.../best.ckpt
+       no skeleton loss, no connectivity loss
+  2. video_eomt_small_512_dinov2_skelrecall.yaml
+       skeleton_coefficient=1.0, skeleton_enabled=true,
+       skeleton_num_dilations=2; no connectivity
+  3. video_eomt_small_512_dinov2_skelrecall_connect.yaml
+       skeleton + connectivity (both coefficients = 1.0)
+
+Common video params:
+  model.class_path:   training.video_mask_classification_instance.VideoMaskClassificationInstance
+  network.class_path: models.video_eomt.VideoEoMT
+  data.class_path:    datasets.video_coronary_instance.VideoCoronaryInstance
+  T: 5,  batch_size: 1
+  etf_heads: 8,  etf_dropout: 0.0
+  consistency_weight: 0.5, consistency_threshold: 0.3, consistency_soft_temp: 0.05
+
+
+8. Running training
+-------------------
+Use the correct python environment:
+  /home/dsa/miniconda3/envs/new_seg_final/bin/python
+
+Train (skelrecall video model):
+  cd /home/dsa/new_seg_final/eomt
+  /home/dsa/miniconda3/envs/new_seg_final/bin/python main.py fit \
+    --config configs/dinov2/coronary/video_instance/video_eomt_small_512_dinov2_skelrecall.yaml
+
+Smoke test:
+  cd /home/dsa/new_seg_final/eomt
+  /home/dsa/miniconda3/envs/new_seg_final/bin/python main.py fit \
+    --config configs/dinov2/coronary/video_instance/video_eomt_small_512_dinov2_skelrecall.yaml \
+    --trainer.fast_dev_run=2 --compile_disabled
+
+
+9. Why initialising from 2D EoMT is safe
+----------------------------------------
+  1. All core weights match EoMT and load from the 2D checkpoint.
+  2. ETF - the only new module - is initialised as identity (out_proj
+     weight/bias = 0).
+  3. On the first step, patch tokens after ETF equal patch tokens before ETF.
+  4. Segmentation head, queries, class head, mask head are unchanged.
+  5. Supervision stays on the central frame, so no labels are needed for
+     before/after frames.
+  6. Temporal information starts to take effect gradually as ETF learns
+     non-zero attention projection weights during fine-tuning.
+
+
+10. Summary diagram
+-------------------
+2D EoMT:
+  image (B,3,H,W)
+    -> ViT patch_embed
+    -> L1 ViT blocks
+    -> add object queries
+    -> L2 ViT blocks + masked attention
+    -> mask/class predictions
+
+Video-EoMT:
+  clip (B,T,3,H,W)
+    -> reshape to (B*T,3,H,W)
+    -> ViT patch_embed
+    -> L1 ViT blocks (per-frame)
+    -> ETF: temporal mixing per patch position
+    -> add object queries
+    -> L2 ViT blocks + masked attention
+    -> mask/class predictions for all frames (B*T,...)
+    -> central-frame EoMT losses
+    -> plus L_num over class logits of all T frames
+
+Video-EoMT is not a new from-scratch architecture - it is a careful video
+extension of EoMT: the 2D model stays the backbone, ETF adds cross-frame
+temporal exchange, and L_num adds temporal stabilisation on the number of
+predicted instances.

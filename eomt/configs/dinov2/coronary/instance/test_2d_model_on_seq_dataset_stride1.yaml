@@ -1,0 +1,31 @@
+trainer:
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: runs
+      name: coronary_instance_eomt_small_512_dinov2
+      version: 0
+model:
+  class_path: training.mask_classification_instance.MaskClassificationInstance
+  init_args:
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [2960, 7400, 11840]
+    attn_mask_annealing_end_steps: [7400, 11840, 14800]
+    warmup_steps: [296, 592]
+    test_results_filename: video_test_results_stride1.txt
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 100
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_dinov2.lvd142m
+            patch_size: 14
+data:
+  class_path: datasets.coronary_instance.CentralFrameCoronaryInstance
+  init_args:
+    path: /home/dsa/segmentation/segmentation_modules/MaskDino/data/sequence_dataset_stride1/sequence_dataset_stride1
+    batch_size: 4
+    num_workers: 4

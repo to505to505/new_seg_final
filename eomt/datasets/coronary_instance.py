@@ -105,6 +105,8 @@ class CoronaryInstance(LightningDataModule):
         skeleton_enabled: bool = False,
         skeleton_num_dilations: int = 2,
         extra_augmentations_enabled: bool = False,
+        hflip_prob: float = 0.5,
+        vflip_prob: float = 0.5,
     ) -> None:
         super().__init__(
             path=path,
@@ -125,6 +127,8 @@ class CoronaryInstance(LightningDataModule):
             skeleton_enabled=skeleton_enabled,
             skeleton_num_dilations=skeleton_num_dilations,
             extra_augmentations_enabled=extra_augmentations_enabled,
+            hflip_prob=hflip_prob,
+            vflip_prob=vflip_prob,
         )
 
     def setup(self, stage: Union[str, None] = None) -> LightningDataModule:
@@ -137,6 +141,10 @@ class CoronaryInstance(LightningDataModule):
         self.val_dataset = CoronaryDataset(
             img_dir=root / "val" / "images",
             label_dir=root / "val" / self.label_subdir,
+        )
+        self.test_dataset = CoronaryDataset(
+            img_dir=root / "test" / "images",
+            label_dir=root / "test" / self.label_subdir,
         )
         return self
 
@@ -152,6 +160,151 @@ class CoronaryInstance(LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
+            collate_fn=self.eval_collate,
+            **self.dataloader_kwargs,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            collate_fn=self.eval_collate,
+            **self.dataloader_kwargs,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Central-frame variant: reads clip folders (video dataset layout) but
+# presents only the central frame to the 2D model.
+# Clip layout: <img_root>/<clip_name>/<clip_name>_central.png
+# Label layout: <label_dir>/<clip_name>.txt  (YOLO polygon, same as usual)
+# ---------------------------------------------------------------------------
+
+class CentralFrameCoronaryDataset(Dataset):
+    """Like CoronaryDataset but clips are sub-directories; only the central
+    frame (<clip>_central.png) is loaded as the image."""
+
+    def __init__(self, img_root: Path, label_dir: Path, transforms=None):
+        super().__init__()
+        self.transforms = transforms
+
+        self.samples = []
+        for clip_dir in sorted(p for p in img_root.iterdir() if p.is_dir()):
+            label_path = label_dir / f"{clip_dir.name}.txt"
+            if not label_path.exists() or label_path.stat().st_size == 0:
+                continue
+            central = next(clip_dir.glob("*_central.png"), None)
+            if central is None:
+                continue
+            self.samples.append((central, label_path))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        img_path, label_path = self.samples[index]
+
+        img = tv_tensors.Image(Image.open(img_path).convert("RGB"))
+        h, w = img.shape[-2], img.shape[-1]
+
+        masks, labels, is_crowd = [], [], []
+        with open(label_path) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 7:
+                    continue
+                class_id = int(parts[0])
+                coords = list(map(float, parts[1:]))
+                polygon = [(coords[i] * w, coords[i + 1] * h) for i in range(0, len(coords) - 1, 2)]
+                if len(polygon) < 3:
+                    continue
+                mask_img = Image.new("L", (w, h), 0)
+                ImageDraw.Draw(mask_img).polygon(polygon, fill=1)
+                mask = torch.from_numpy(np.array(mask_img, dtype=np.uint8)).bool()
+                if not mask.any():
+                    continue
+                masks.append(tv_tensors.Mask(mask))
+                labels.append(class_id)
+                is_crowd.append(False)
+
+        if not masks:
+            masks = [tv_tensors.Mask(torch.zeros(h, w, dtype=torch.bool))]
+            labels = [0]
+            is_crowd = [False]
+
+        target = {
+            "masks": tv_tensors.Mask(torch.stack(masks)),
+            "labels": torch.tensor(labels),
+            "is_crowd": torch.tensor(is_crowd),
+        }
+
+        if self.transforms is not None:
+            img, target = self.transforms(img, target)
+
+        return img, target
+
+
+class CentralFrameCoronaryInstance(LightningDataModule):
+    """LightningDataModule wrapping CentralFrameCoronaryDataset.
+    Useful for evaluating a 2D model on a video-format dataset by
+    extracting only the central frame of each clip."""
+
+    def __init__(
+        self,
+        path,
+        num_workers: int = 4,
+        batch_size: int = 4,
+        img_size: tuple[int, int] = (512, 512),
+        num_classes: int = 9,
+        check_empty_targets: bool = True,
+        label_subdir: str = "labels",
+    ) -> None:
+        super().__init__(
+            path=path,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            num_classes=num_classes,
+            img_size=img_size,
+            check_empty_targets=check_empty_targets,
+        )
+        self.save_hyperparameters(ignore=["_class_path"])
+        self.label_subdir = label_subdir
+
+    def setup(self, stage: Union[str, None] = None) -> LightningDataModule:
+        root = Path(self.path)
+        # train/val are placeholders (test-only usage)
+        self.train_dataset = CentralFrameCoronaryDataset(
+            img_root=root / "train" / "images",
+            label_dir=root / "train" / self.label_subdir,
+        )
+        self.val_dataset = CentralFrameCoronaryDataset(
+            img_root=root / "val" / "images",
+            label_dir=root / "val" / self.label_subdir,
+        )
+        self.test_dataset = CentralFrameCoronaryDataset(
+            img_root=root / "test" / "images",
+            label_dir=root / "test" / self.label_subdir,
+        )
+        return self
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            shuffle=True,
+            drop_last=True,
+            collate_fn=self.train_collate,
+            **self.dataloader_kwargs,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            collate_fn=self.eval_collate,
+            **self.dataloader_kwargs,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
             collate_fn=self.eval_collate,
             **self.dataloader_kwargs,
         )

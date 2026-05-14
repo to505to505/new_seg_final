@@ -31,6 +31,8 @@ class Transforms(nn.Module):
         skeleton_enabled: bool = False,
         skeleton_num_dilations: int = 2,
         extra_augmentations_enabled: bool = False,
+        hflip_prob: float = 0.5,
+        vflip_prob: float = 0.5,
     ):
         super().__init__()
 
@@ -44,8 +46,8 @@ class Transforms(nn.Module):
         self.max_saturation_factor = saturation_factor
         self.max_hue_delta = max_hue_delta / 360.0
 
-        self.random_horizontal_flip = T.RandomHorizontalFlip()
-        self.random_vertical_flip = T.RandomVerticalFlip()
+        self.random_horizontal_flip = T.RandomHorizontalFlip(p=hflip_prob)
+        self.random_vertical_flip = T.RandomVerticalFlip(p=vflip_prob)
         self.scale_jitter = T.ScaleJitter(target_size=img_size, scale_range=scale_range)
         self.random_crop = T.RandomCrop(img_size)
 

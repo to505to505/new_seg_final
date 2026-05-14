@@ -1,0 +1,2 @@
+(0018,1510) Positioner Primary Angle: 2
+(0018,1511) Positioner Secondary Angle: 30

@@ -1,0 +1,33 @@
+trainer:
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: runs
+      name: coronary_instance_eomt_small_518_dinov2_skelrecall_newdata
+      version: test_single
+model:
+  class_path: training.mask_classification_instance.MaskClassificationInstance
+  init_args:
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [2030, 5075, 8120]
+    attn_mask_annealing_end_steps: [5075, 8120, 10150]
+    warmup_steps: [203, 406]
+    skeleton_coefficient: 1.0
+    test_results_filename: test_results_single.txt
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_q: 100
+        num_blocks: 3
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_dinov2.lvd142m
+            patch_size: 14
+data:
+  class_path: datasets.coronary_instance.CoronaryInstance
+  init_args:
+    path: /home/dsa/new_seg_final/single_dataset_final
+    img_size: [518, 518]
+    skeleton_enabled: true
+    skeleton_num_dilations: 2

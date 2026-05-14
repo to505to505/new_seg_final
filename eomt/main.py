@@ -156,7 +156,7 @@ class LightningCLI(cli.LightningCLI):
             run_dir = os.path.join(self.trainer.default_root_dir, "default_run")
 
         ckpt_dir = os.path.join(run_dir, "checkpoints")
-        monitor = "metrics/val_combined"
+        monitor = "metrics/val_solo_ap_all"
 
         self.trainer.callbacks.append(
             ModelCheckpoint(

@@ -251,6 +251,11 @@ class LightningModule(lightning.LightningModule):
         self.lcr_metrics = nn.ModuleList(
             [LargestComponentRatio(connectivity=8) for _ in range(num_blocks)]
         )
+        # "solo" mAP: each predicted mask is reduced to its largest connected
+        # component before scoring, mirroring the LCR-style cleanup.
+        self.solo_metrics = nn.ModuleList(
+            [MeanAveragePrecision(iou_type="segm") for _ in range(num_blocks)]
+        )
 
     def init_metrics_panoptic(self, thing_classes, stuff_classes, num_blocks):
         self.metrics = nn.ModuleList(
@@ -282,6 +287,51 @@ class LightningModule(lightning.LightningModule):
         block_idx,
     ):
         self.lcr_metrics[block_idx].update(preds)
+
+    @staticmethod
+    def _largest_component_masks(masks: torch.Tensor) -> torch.Tensor:
+        """Return a copy of ``masks`` (N, H, W) bool with each mask reduced to
+        its single largest 8-connected component. Empty masks are kept empty."""
+        from scipy.ndimage import label as _scipy_label
+        import numpy as _np
+
+        if masks.numel() == 0:
+            return masks.clone()
+        structure = _np.ones((3, 3), dtype=_np.int32)
+        out = torch.zeros_like(masks)
+        masks_np = masks.detach().cpu().numpy().astype(_np.uint8)
+        for i in range(masks_np.shape[0]):
+            m = masks_np[i]
+            if m.sum() == 0:
+                continue
+            lab, n = _scipy_label(m, structure=structure)
+            if n <= 1:
+                out[i] = masks[i]
+                continue
+            sizes = _np.bincount(lab.ravel())
+            sizes[0] = 0
+            largest = int(sizes.argmax())
+            kept = torch.from_numpy(lab == largest).to(masks.device)
+            out[i] = kept
+        return out
+
+    @torch.compiler.disable
+    def update_solo_instance(
+        self,
+        preds: list[dict],
+        targets: list[dict],
+        block_idx,
+    ):
+        solo_preds = []
+        for pred in preds:
+            solo_preds.append(
+                dict(
+                    masks=self._largest_component_masks(pred["masks"]),
+                    labels=pred["labels"],
+                    scores=pred["scores"],
+                )
+            )
+        self.solo_metrics[block_idx].update(solo_preds, targets)
 
     @torch.compiler.disable
     def update_metrics_instance(
@@ -424,49 +474,89 @@ class LightningModule(lightning.LightningModule):
             )
 
     def _on_eval_epoch_end_instance(self, log_prefix):
+        solo_only = getattr(self, 'solo_only', False)
         for i, metric in enumerate(self.metrics):  # type: ignore
-            results = metric.compute()
+            if not solo_only:
+                results = metric.compute()
             metric.reset()
 
-            lcr_value = self.lcr_metrics[i].compute()
+            if not solo_only:
+                lcr_value = self.lcr_metrics[i].compute()
             self.lcr_metrics[i].reset()
 
+            solo_results = self.solo_metrics[i].compute()
+            self.solo_metrics[i].reset()
+
             block_postfix = self.block_postfix(i)
+            if not solo_only:
+                self.log(
+                    f"metrics/{log_prefix}_ap_all{block_postfix}",
+                    results["map"],
+                )
+                self.log(
+                    f"metrics/{log_prefix}_ap_small_all{block_postfix}",
+                    results["map_small"],
+                )
+                self.log(
+                    f"metrics/{log_prefix}_ap_medium_all{block_postfix}",
+                    results["map_medium"],
+                )
+                self.log(
+                    f"metrics/{log_prefix}_ap_large_all{block_postfix}",
+                    results["map_large"],
+                )
+                self.log(
+                    f"metrics/{log_prefix}_ap_50_all{block_postfix}",
+                    results["map_50"],
+                )
+                self.log(
+                    f"metrics/{log_prefix}_ap_75_all{block_postfix}",
+                    results["map_75"],
+                )
+                self.log(
+                    f"metrics/{log_prefix}_lcr_all{block_postfix}",
+                    lcr_value,
+                )
+
+            # Solo mAP: predictions reduced to their largest connected component.
             self.log(
-                f"metrics/{log_prefix}_ap_all{block_postfix}",
-                results["map"],
+                f"metrics/{log_prefix}_solo_ap_all{block_postfix}",
+                solo_results["map"],
             )
             self.log(
-                f"metrics/{log_prefix}_ap_small_all{block_postfix}",
-                results["map_small"],
+                f"metrics/{log_prefix}_solo_ap_50_all{block_postfix}",
+                solo_results["map_50"],
             )
             self.log(
-                f"metrics/{log_prefix}_ap_medium_all{block_postfix}",
-                results["map_medium"],
+                f"metrics/{log_prefix}_solo_ap_75_all{block_postfix}",
+                solo_results["map_75"],
             )
             self.log(
-                f"metrics/{log_prefix}_ap_large_all{block_postfix}",
-                results["map_large"],
+                f"metrics/{log_prefix}_solo_ap_small_all{block_postfix}",
+                solo_results["map_small"],
             )
             self.log(
-                f"metrics/{log_prefix}_ap_50_all{block_postfix}",
-                results["map_50"],
+                f"metrics/{log_prefix}_solo_ap_medium_all{block_postfix}",
+                solo_results["map_medium"],
             )
             self.log(
-                f"metrics/{log_prefix}_ap_75_all{block_postfix}",
-                results["map_75"],
-            )
-            self.log(
-                f"metrics/{log_prefix}_lcr_all{block_postfix}",
-                lcr_value,
+                f"metrics/{log_prefix}_solo_ap_large_all{block_postfix}",
+                solo_results["map_large"],
             )
 
-            lcr_weight = getattr(self, 'lcr_weight', 0.2)
-            combined = (1.0 - lcr_weight) * results["map"] + lcr_weight * lcr_value
-            self.log(
-                f"metrics/{log_prefix}_combined{block_postfix}",
-                combined,
-            )
+            if not solo_only:
+                lcr_weight = getattr(self, 'lcr_weight', 0.2)
+                combined = (1.0 - lcr_weight) * results["map"] + lcr_weight * lcr_value
+                self.log(
+                    f"metrics/{log_prefix}_combined{block_postfix}",
+                    combined,
+                )
+                # Solo combined: same weighting but using the solo (cleaned) mAP.
+                solo_combined = (1.0 - lcr_weight) * solo_results["map"] + lcr_weight * lcr_value
+                self.log(
+                    f"metrics/{log_prefix}_solo_combined{block_postfix}",
+                    solo_combined,
+                )
 
     def _on_eval_epoch_end_panoptic(self, log_prefix, log_per_class=False):
         for i, metric in enumerate(self.metrics):  # type: ignore
@@ -543,6 +633,14 @@ class LightningModule(lightning.LightningModule):
 
     def _on_eval_end_instance(self, log_prefix):
         if not self.trainer.sanity_checking:
+            if getattr(self, 'solo_only', False):
+                rank_zero_info(
+                    f"{bold_green}Solo mAP All: {self.trainer.callback_metrics[f'metrics/{log_prefix}_solo_ap_all'] * 100:.1f} | "
+                    f"Solo mAP Small: {self.trainer.callback_metrics[f'metrics/{log_prefix}_solo_ap_small_all'] * 100:.1f} | "
+                    f"Solo mAP Medium: {self.trainer.callback_metrics[f'metrics/{log_prefix}_solo_ap_medium_all'] * 100:.1f} | "
+                    f"Solo mAP Large: {self.trainer.callback_metrics[f'metrics/{log_prefix}_solo_ap_large_all'] * 100:.1f}{reset}"
+                )
+                return
             rank_zero_info(
                 f"{bold_green}mAP All: {self.trainer.callback_metrics[f'metrics/{log_prefix}_ap_all'] * 100:.1f} | "
                 f"mAP Small: {self.trainer.callback_metrics[f'metrics/{log_prefix}_ap_small_all'] * 100:.1f} | "
@@ -559,6 +657,44 @@ class LightningModule(lightning.LightningModule):
                 f"PQ Things: {self.trainer.callback_metrics[f'metrics/{log_prefix}_pq_things'] * 100:.1f} | "
                 f"PQ Stuff: {self.trainer.callback_metrics[f'metrics/{log_prefix}_pq_stuff'] * 100:.1f}{reset}"
             )
+
+    def _write_test_results_txt(self, filename: str = "test_results.txt"):
+        import os
+        m = self.trainer.callback_metrics
+        log_prefix = "test"
+        backbone = self.network.encoder.backbone_name if hasattr(self.network.encoder, "backbone_name") else "unknown"
+        patch_size = self.network.encoder.patch_size if hasattr(self.network.encoder, "patch_size") else "?"
+        ckpt = self.trainer.ckpt_path or "best.ckpt"
+        run_name = self.trainer.logger.name if self.trainer.logger else "unknown"
+
+        lines = [
+            f"Test Results on Test Set ({os.path.basename(str(ckpt))})",
+            "=====================================",
+            f"Model: {run_name}",
+            f"Backbone: {backbone} (patch_size={patch_size})",
+            "=====================================",
+            "",
+            f"mAP All:    {m.get(f'metrics/{log_prefix}_ap_all', 0) * 100:.1f}",
+            f"mAP Small:  {m.get(f'metrics/{log_prefix}_ap_small_all', 0) * 100:.1f}",
+            f"mAP Medium: {m.get(f'metrics/{log_prefix}_ap_medium_all', 0) * 100:.1f}",
+            f"mAP Large:  {m.get(f'metrics/{log_prefix}_ap_large_all', 0) * 100:.1f}",
+            "",
+            f"Solo mAP All:    {m.get(f'metrics/{log_prefix}_solo_ap_all', 0) * 100:.1f}",
+            f"Solo mAP Small:  {m.get(f'metrics/{log_prefix}_solo_ap_small_all', 0) * 100:.1f}",
+            f"Solo mAP Medium: {m.get(f'metrics/{log_prefix}_solo_ap_medium_all', 0) * 100:.1f}",
+            f"Solo mAP Large:  {m.get(f'metrics/{log_prefix}_solo_ap_large_all', 0) * 100:.1f}",
+            "",
+        ]
+        for k, v in sorted(m.items()):
+            if k.startswith(f"metrics/{log_prefix}_"):
+                lines.append(f"{k}: {float(v):.4f}")
+
+        out_dir = self.trainer.logger.log_dir if self.trainer.logger else self.trainer.default_root_dir
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, filename)
+        with open(out_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        rank_zero_info(f"Test results written to {out_path}")
 
     @torch.compiler.disable
     def plot_semantic(
@@ -917,6 +1053,28 @@ class LightningModule(lightning.LightningModule):
                 for k, v in ckpt.items()
                 if "class_head" not in k and "class_predictor" not in k
             }
+        # Handle pos_embed size mismatch by bicubic interpolation
+        current_sd = self.state_dict()
+        for key in list(ckpt.keys()):
+            if key in current_sd and ckpt[key].shape != current_sd[key].shape:
+                if "pos_embed" in key and ckpt[key].ndim == 3:
+                    src = ckpt[key]  # [1, N_src, D]
+                    tgt_len = current_sd[key].shape[1]
+                    cls_tok, patch_src = src[:, :1, :], src[:, 1:, :]
+                    n_src = patch_src.shape[1]
+                    n_tgt = tgt_len - 1
+                    h_src = w_src = int(n_src ** 0.5)
+                    h_tgt = w_tgt = int(n_tgt ** 0.5)
+                    patch_src = patch_src.reshape(1, h_src, w_src, -1).permute(0, 3, 1, 2)
+                    patch_src = torch.nn.functional.interpolate(
+                        patch_src.float(), size=(h_tgt, w_tgt), mode="bicubic", align_corners=False
+                    ).to(src.dtype)
+                    patch_src = patch_src.permute(0, 2, 3, 1).reshape(1, n_tgt, -1)
+                    ckpt[key] = torch.cat([cls_tok, patch_src], dim=1)
+                    logging.info(f"Interpolated pos_embed {key}: {src.shape} -> {ckpt[key].shape}")
+                else:
+                    del ckpt[key]
+                    logging.warning(f"Removed mismatched key {key} from checkpoint")
         logging.info(f"Loaded {len(ckpt)} keys")
         return ckpt
 

@@ -5,7 +5,7 @@ trainer:
     class_path: lightning.pytorch.loggers.CSVLogger
     init_args:
       save_dir: runs
-      name: coronary_instance_eomt_small_512_dinov2
+      name: coronary_instance_eomt_small_512_dinov2_new_augs
 model:
   class_path: training.mask_classification_instance.MaskClassificationInstance
   init_args:
@@ -26,4 +26,5 @@ model:
 data:
   class_path: datasets.coronary_instance.CoronaryInstance
   init_args:
+    path: /home/dsa/new_seg_final/single_dataset
     extra_augmentations_enabled: true
