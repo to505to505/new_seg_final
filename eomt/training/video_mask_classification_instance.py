@@ -31,6 +31,7 @@ from torchvision.transforms.v2.functional import pad
 from training.mask_classification_instance import MaskClassificationInstance
 from training.num_consistency_loss import num_consistency_loss
 from training.distillation_losses import CRRCDLoss, class_kl_loss, mask_kd_loss
+from training.temporal_query_nce import temporal_query_nce_loss
 
 
 class VideoMaskClassificationInstance(MaskClassificationInstance):
@@ -89,6 +90,11 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
         general_kd_enabled: bool = True,
         general_num_queries: int = 100,
         general_loss_weight: float = 1.0,
+        # ---- Temporal per-query InfoNCE (self-supervised consistency) ----
+        nce_enabled: bool = False,
+        nce_loss_weight: float = 0.1,
+        nce_temperature: float = 0.1,
+        nce_alive_threshold: float = 0.2,
     ):
         super().__init__(
             network=network,
@@ -141,6 +147,11 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
         self.general_kd_enabled = general_kd_enabled
         self.general_num_queries = general_num_queries
         self.general_loss_weight = general_loss_weight
+
+        self.nce_enabled = nce_enabled
+        self.nce_loss_weight = nce_loss_weight
+        self.nce_temperature = nce_temperature
+        self.nce_alive_threshold = nce_alive_threshold
 
         # The teacher is held in a list so it is NOT registered as a
         # submodule: it must stay out of state_dict / named_parameters
@@ -274,6 +285,10 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
 
         # ---- Branch 1: standard student forward (detection branch) ----
         mask_logits_per_block, class_logits_per_block = self(imgs)
+        # Capture query hidden states from Branch 1 immediately — the KD
+        # branches re-run the student with different queries and would
+        # overwrite self.network._captured_decoder_hs.
+        student_hs_branch1 = self.network._captured_decoder_hs
 
         losses_all_blocks = {}
         for i, (mask_logits, class_logits) in enumerate(
@@ -305,6 +320,23 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
             )
             self.log("loss_num", l_num, on_step=True, prog_bar=False)
             total = total + self.consistency_weight * l_num
+
+        # ---- Self-supervised temporal query InfoNCE ----
+        if self.nce_enabled and T > 1 and student_hs_branch1 is not None:
+            hs_btkd = student_hs_branch1.view(B, T, *student_hs_branch1.shape[1:])
+            final_class = class_logits_per_block[-1].view(
+                B, T, *class_logits_per_block[-1].shape[1:]
+            )
+            # Per-query foreground confidence (detached: only gates the loss).
+            fg_conf = final_class.softmax(dim=-1)[..., :-1].amax(dim=-1).detach()
+            l_nce = temporal_query_nce_loss(
+                hs_btkd,
+                fg_conf,
+                temperature=self.nce_temperature,
+                alive_threshold=self.nce_alive_threshold,
+            )
+            self.log("loss_nce", l_nce, on_step=True, prog_bar=False)
+            total = total + self.nce_loss_weight * l_nce
 
         # ---- Branches 2 & 3: knowledge distillation ----
         if self.distill_enabled:
