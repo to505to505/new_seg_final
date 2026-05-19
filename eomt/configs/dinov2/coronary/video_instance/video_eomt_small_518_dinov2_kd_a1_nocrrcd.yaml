@@ -1,0 +1,79 @@
+# Video-EoMT with knowledge distillation from a frozen 2D EoMT teacher
+# (same 518x518 resolution). 3-branch training:
+#   Branch 1 — standard student detection loss (central frame) + L_num.
+#   Branch 2 — specific KD: teacher queries injected into the student;
+#              class KL + mask Dice/BCE + relational CRRCD.
+#   Branch 3 — general KD: random queries injected into teacher+student;
+#              class KL + mask Dice/BCE weighted by teacher background prob.
+#
+# compile_disabled is set: the KD branches read the model's captured
+# decoder hidden states as an attribute and call an uncompiled teacher,
+# which does not play well with torch.compile.
+compile_disabled: true
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 1
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: runs
+      name: coronary_video_eomt_small_518_dinov2_kd_a1_nocrrcd
+
+model:
+  class_path: training.video_mask_classification_instance.VideoMaskClassificationInstance
+  init_args:
+    attn_mask_annealing_enabled: True
+    attn_mask_annealing_start_steps: [2800, 7000, 11200]
+    attn_mask_annealing_end_steps: [7000, 11200, 14000]
+    warmup_steps: [280, 560]
+    skeleton_coefficient: 1.0
+    consistency_weight: 0.5
+    consistency_threshold: 0.3
+    consistency_soft_temp: 0.05
+    solo_only: true
+    ckpt_path: /home/dsa/new_seg_final/eomt/runs/coronary_instance_eomt_small_518_dinov2_skelrecall_newdata/version_0/checkpoints/best.ckpt
+    delta_weights: false
+    load_ckpt_class_head: true
+    # ---- Knowledge distillation ----
+    distill_enabled: true
+    teacher_ckpt_path: /home/dsa/new_seg_final/eomt/runs/coronary_instance_eomt_small_518_dinov2_skelrecall_newdata/version_0/checkpoints/best.ckpt
+    distill_loss_weight: 1.0
+    distill_class_weight: 1.0
+    distill_mask_bce_weight: 1.0
+    distill_mask_dice_weight: 1.0
+    distill_temperature: 1.0
+    crrcd_enabled: false
+    crrcd_loss_weight: 1.0
+    crrcd_relation_dim: 128
+    crrcd_hidden_dim: 256
+    crrcd_num_fg: 20
+    crrcd_num_bg: 20
+    crrcd_num_negatives: 0
+    crrcd_temperature: 0.5
+    general_kd_enabled: true
+    general_num_queries: 100
+    general_loss_weight: 1.0
+    network:
+      class_path: models.video_eomt.VideoEoMT
+      init_args:
+        num_q: 100
+        num_blocks: 3
+        etf_heads: 8
+        etf_dropout: 0.0
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_dinov2.lvd142m
+            patch_size: 14
+
+data:
+  class_path: datasets.video_coronary_instance.VideoCoronaryInstance
+  init_args:
+    path: /home/dsa/segmentation/segmentation_modules/MaskDino/data/sequence_dataset
+    batch_size: 1
+    num_workers: 4
+    T: 5
+    img_size: [518, 518]
+    skeleton_enabled: true
+    skeleton_num_dilations: 2

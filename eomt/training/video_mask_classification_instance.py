@@ -4,8 +4,23 @@
 # instance-segmentation losses, while applying a temporal count-
 # consistency loss (L_num) over the full T-frame window so the ETF
 # module learns to share information across time.
+#
+# Optionally runs a 3-branch knowledge-distillation step from a frozen
+# 2D EoMT teacher (same 518x518 resolution):
+#   Branch 1 — standard student forward (detection branch).
+#   Branch 2 — specific KD: the student is run with the teacher's
+#              object queries injected before the L2 blocks; class KL,
+#              mask Dice+BCE and relational CRRCD losses are computed
+#              on the central frame, weighted by the teacher's per-query
+#              foreground confidence.
+#   Branch 3 — general KD: random unlearnable queries are injected into
+#              both teacher and student; class KL + mask Dice+BCE are
+#              weighted by the teacher's background probability to
+#              suppress false-positive masks on the background.
+# Instance segmentation only — no bounding-box regression losses.
 # ---------------------------------------------------------------
 
+import copy
 from typing import List, Optional
 
 import torch
@@ -15,6 +30,7 @@ from torchvision.transforms.v2.functional import pad
 
 from training.mask_classification_instance import MaskClassificationInstance
 from training.num_consistency_loss import num_consistency_loss
+from training.distillation_losses import CRRCDLoss, class_kl_loss, mask_kd_loss
 
 
 class VideoMaskClassificationInstance(MaskClassificationInstance):
@@ -54,6 +70,25 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
         consistency_soft_temp: float = 0.05,
         test_results_filename: str = "video_test_results.txt",
         solo_only: bool = False,
+        # ---- Knowledge distillation ----
+        distill_enabled: bool = False,
+        teacher_ckpt_path: Optional[str] = None,
+        distill_loss_weight: float = 1.0,
+        distill_class_weight: float = 1.0,
+        distill_mask_bce_weight: float = 1.0,
+        distill_mask_dice_weight: float = 1.0,
+        distill_temperature: float = 1.0,
+        crrcd_enabled: bool = True,
+        crrcd_loss_weight: float = 1.0,
+        crrcd_relation_dim: int = 128,
+        crrcd_hidden_dim: int = 256,
+        crrcd_num_fg: int = 20,
+        crrcd_num_bg: int = 20,
+        crrcd_num_negatives: int = 0,
+        crrcd_temperature: float = 0.5,
+        general_kd_enabled: bool = True,
+        general_num_queries: int = 100,
+        general_loss_weight: float = 1.0,
     ):
         super().__init__(
             network=network,
@@ -94,25 +129,123 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
         self.consistency_threshold = consistency_threshold
         self.consistency_soft_temp = consistency_soft_temp
 
+        # ---- Knowledge distillation setup ----
+        self.distill_enabled = distill_enabled
+        self.distill_loss_weight = distill_loss_weight
+        self.distill_class_weight = distill_class_weight
+        self.distill_mask_bce_weight = distill_mask_bce_weight
+        self.distill_mask_dice_weight = distill_mask_dice_weight
+        self.distill_temperature = distill_temperature
+        self.crrcd_enabled = crrcd_enabled
+        self.crrcd_loss_weight = crrcd_loss_weight
+        self.general_kd_enabled = general_kd_enabled
+        self.general_num_queries = general_num_queries
+        self.general_loss_weight = general_loss_weight
+
+        # The teacher is held in a list so it is NOT registered as a
+        # submodule: it must stay out of state_dict / named_parameters
+        # (frozen, never optimised, never checkpointed).
+        self._teacher_holder: list = []
+        self.crrcd = None
+
+        if distill_enabled:
+            teacher_ckpt = teacher_ckpt_path or ckpt_path
+            if teacher_ckpt is None:
+                raise ValueError(
+                    "distill_enabled=True requires teacher_ckpt_path "
+                    "(or ckpt_path) pointing at a 2D EoMT checkpoint"
+                )
+            self._teacher_holder = [self._build_teacher(teacher_ckpt)]
+            if crrcd_enabled:
+                embed_dim = self.network.encoder.backbone.embed_dim
+                self.crrcd = CRRCDLoss(
+                    hidden_dim=embed_dim,
+                    relation_dim=crrcd_relation_dim,
+                    frm_hidden_dim=crrcd_hidden_dim,
+                    num_fg=crrcd_num_fg,
+                    num_bg=crrcd_num_bg,
+                    num_negatives=crrcd_num_negatives,
+                    temperature=crrcd_temperature,
+                )
+
     def _raise_on_incompatible(self, incompatible_keys, load_ckpt_class_head):
         # Drop ETF keys from missing list: ETF is a new module that does not
         # exist in 2D EoMT checkpoints; it is initialised to identity (zero
         # out_proj), so absence in the source ckpt is safe.
-        # Drop criterion.* from unexpected list: the criterion is constructed
-        # only later in MaskClassificationInstance.__init__, after the parent's
-        # _load_ckpt call, so it is normal for these keys to look unexpected.
+        # Drop criterion.* / crrcd.* from unexpected list: the criterion and
+        # the CRRCD module are constructed only after the parent's _load_ckpt
+        # call, so it is normal for these keys to look unexpected/missing.
         filtered_missing = [
             k for k in incompatible_keys.missing_keys
-            if not k.startswith("network.etf.")
+            if not k.startswith("network.etf.") and not k.startswith("crrcd.")
         ]
         filtered_unexpected = [
             k for k in incompatible_keys.unexpected_keys
-            if not k.startswith("criterion.")
+            if not k.startswith("criterion.") and not k.startswith("crrcd.")
         ]
         if filtered_missing or filtered_unexpected:
             from torch.nn.modules.module import _IncompatibleKeys
             filtered = _IncompatibleKeys(filtered_missing, filtered_unexpected)
             super()._raise_on_incompatible(filtered, load_ckpt_class_head)
+
+    # ------------------------------------------------------------------
+    # Teacher
+    # ------------------------------------------------------------------
+
+    @property
+    def teacher(self):
+        return self._teacher_holder[0] if self._teacher_holder else None
+
+    def _build_teacher(self, ckpt_path: str) -> nn.Module:
+        """Frozen 2D EoMT teacher: a deep copy of the student network with
+        the 2D checkpoint weights loaded. Because VideoEoMT processes a
+        4D (B, 3, H, W) input as a T=1 pass-through (ETF skipped), the
+        teacher behaves exactly like the original 2D EoMT model."""
+        teacher = copy.deepcopy(self.network)
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        if "state_dict" in ckpt:
+            ckpt = ckpt["state_dict"]
+        teacher_sd = {
+            k[len("network."):]: v
+            for k, v in ckpt.items()
+            if k.startswith("network.")
+        }
+        incompatible = teacher.load_state_dict(teacher_sd, strict=False)
+        missing = [
+            k for k in incompatible.missing_keys if not k.startswith("etf.")
+        ]
+        if missing:
+            raise ValueError(f"Teacher checkpoint missing keys: {missing}")
+
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        teacher.eval()
+        return teacher
+
+    def _ensure_teacher_device(self):
+        teacher = self.teacher
+        if teacher is None:
+            return
+        param = next(teacher.parameters(), None)
+        if param is not None and param.device != self.device:
+            teacher.to(self.device)
+
+    @torch.compiler.disable
+    def _teacher_forward(self, frames, query_mode="student", injected_queries=None):
+        """Run the frozen teacher and return (outputs, query_hidden_states).
+
+        `frames` are expected already scaled to [0, 1] (same convention as
+        LightningModule.forward). Compiler-disabled because the teacher is
+        a plain, uncompiled module held outside the LightningModule graph.
+        """
+        teacher = self.teacher
+        with torch.no_grad():
+            out = teacher(
+                frames, query_mode=query_mode, injected_queries=injected_queries
+            )
+            hs = teacher._captured_decoder_hs
+        return out, (hs.detach() if hs is not None else None)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -139,6 +272,7 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
         imgs, targets = batch  # imgs: (B, T, 3, H, W); targets: list[dict] of length B
         B, T = imgs.shape[0], imgs.shape[1]
 
+        # ---- Branch 1: standard student forward (detection branch) ----
         mask_logits_per_block, class_logits_per_block = self(imgs)
 
         losses_all_blocks = {}
@@ -172,7 +306,108 @@ class VideoMaskClassificationInstance(MaskClassificationInstance):
             self.log("loss_num", l_num, on_step=True, prog_bar=False)
             total = total + self.consistency_weight * l_num
 
+        # ---- Branches 2 & 3: knowledge distillation ----
+        if self.distill_enabled:
+            total = total + self._distillation_step(imgs, B, T)
+
         return total
+
+    def _distillation_step(self, imgs: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        """3-branch KD from the frozen 2D EoMT teacher. Branch 1 (detection)
+        is handled in training_step; this covers Branch 2 (specific KD +
+        CRRCD) and Branch 3 (general KD). All KD losses are computed on the
+        central frame only."""
+        self._ensure_teacher_device()
+        central_idx = self._central_idx(T)
+
+        x = imgs / 255.0                       # student input, full clip
+        teacher_frames = x[:, central_idx]     # (B, 3, H, W) — same 518x518
+
+        kd_total = imgs.new_zeros(())
+
+        # ===== Branch 2: specific KD + relational distillation =====
+        t_out, teacher_hs = self._teacher_forward(teacher_frames)
+        t_mask_logits = t_out[0][-1]           # (B, K, h, w)
+        t_class_logits = t_out[1][-1]          # (B, K, C+1)
+
+        # Teacher object queries (captured before the L2 blocks) — for EoMT
+        # these are the static learnable query embeddings of the teacher.
+        teacher_queries = self.teacher.q.weight.detach()
+
+        # Per-query teacher foreground confidence.
+        fg_weight = t_class_logits.softmax(dim=-1).amax(dim=-1)  # (B, K)
+
+        # Student KD forward: full clip, teacher queries injected before L2.
+        s_mask_pl, s_class_pl = self.network(
+            x, query_mode="teacher", injected_queries=teacher_queries
+        )
+        student_hs = self._slice_central(self.network._captured_decoder_hs, B, T)
+        s_mask_central = self._slice_central(s_mask_pl[-1], B, T)
+        s_class_central = self._slice_central(s_class_pl[-1], B, T)
+
+        kd_class = class_kl_loss(
+            s_class_central, t_class_logits, fg_weight, self.distill_temperature
+        )
+        kd_mask_bce, kd_mask_dice = mask_kd_loss(
+            s_mask_central, t_mask_logits, fg_weight
+        )
+        self.log("kd/class", kd_class, on_step=True)
+        self.log("kd/mask_bce", kd_mask_bce, on_step=True)
+        self.log("kd/mask_dice", kd_mask_dice, on_step=True)
+        kd_total = kd_total + self.distill_loss_weight * (
+            self.distill_class_weight * kd_class
+            + self.distill_mask_bce_weight * kd_mask_bce
+            + self.distill_mask_dice_weight * kd_mask_dice
+        )
+
+        if self.crrcd is not None:
+            kd_crrcd = self.crrcd(
+                teacher_hs=teacher_hs,
+                student_hs=student_hs,
+                weights=fg_weight,
+            )
+            self.log("kd/crrcd", kd_crrcd, on_step=True)
+            kd_total = kd_total + self.crrcd_loss_weight * kd_crrcd
+
+        # ===== Branch 3: general KD (background scanning) =====
+        if self.general_kd_enabled:
+            embed_dim = self.network.encoder.backbone.embed_dim
+            # Random, unlearnable queries shared by teacher and student.
+            gen_q = torch.randn(
+                self.general_num_queries, embed_dim,
+                device=imgs.device, dtype=torch.float32,
+            )
+
+            tg_out, _ = self._teacher_forward(
+                teacher_frames, query_mode="general", injected_queries=gen_q
+            )
+            tg_mask_logits = tg_out[0][-1]
+            tg_class_logits = tg_out[1][-1]
+            # Teacher background probability — high where the teacher is
+            # confident the slot is background; teaches the student to
+            # suppress false-positive masks there.
+            bg_weight = tg_class_logits.softmax(dim=-1)[..., -1]  # (B, K)
+
+            sg_mask_pl, sg_class_pl = self.network(
+                x, query_mode="general", injected_queries=gen_q
+            )
+            sg_mask_central = self._slice_central(sg_mask_pl[-1], B, T)
+            sg_class_central = self._slice_central(sg_class_pl[-1], B, T)
+
+            gen_class = class_kl_loss(
+                sg_class_central, tg_class_logits, bg_weight, self.distill_temperature
+            )
+            gen_mask_bce, gen_mask_dice = mask_kd_loss(
+                sg_mask_central, tg_mask_logits, bg_weight
+            )
+            self.log("kd/gen_class", gen_class, on_step=True)
+            self.log("kd/gen_mask_bce", gen_mask_bce, on_step=True)
+            self.log("kd/gen_mask_dice", gen_mask_dice, on_step=True)
+            kd_total = kd_total + self.general_loss_weight * (
+                gen_class + gen_mask_bce + gen_mask_dice
+            )
+
+        return kd_total
 
     # ------------------------------------------------------------------
     # Evaluation (central-frame only)
